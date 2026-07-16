@@ -8,6 +8,8 @@ metadata:
     app: {{ include "migration-toolkit-rhcl.frontend" . }}
     app.kubernetes.io/component: frontend
     {{- include "migration-toolkit-rhcl.labels" . | nindent 4 }}
+  annotations:
+    haproxy.router.openshift.io/timeout: {{ .Values.route.timeout | default "5m" | quote }}
 spec:
   {{- if .Values.route.host }}
   host: {{ .Values.route.host }}
