@@ -64,6 +64,22 @@ class ThreeScaleExportServiceTest {
         assertNotNull(ex.getCause() != null ? ex.getCause() : ex);
     }
 
+    @Test
+    void stripUsagePrefix_removesBackendUsagePath() {
+        assertEquals("/api/v1/customers$",
+                ThreeScaleExportService.stripUsagePrefix("/api/v1/customers/api/v1/customers$", "/api/v1/customers"));
+        assertEquals("/q/openapi$",
+                ThreeScaleExportService.stripUsagePrefix("/api/v1/customers/q/openapi$", "/api/v1/customers"));
+        assertEquals("/", ThreeScaleExportService.stripUsagePrefix("/", "/api/v1/customers"));
+    }
+
+    @Test
+    void windowFor_maps3scalePeriods() {
+        assertEquals("1m", ThreeScaleExportService.windowFor("minute"));
+        assertEquals("1h", ThreeScaleExportService.windowFor("hour"));
+        assertNull(ThreeScaleExportService.windowFor("eternity"));
+    }
+
     // ── extractAuthentication() ───────────────────────────────────────────────
 
     @ParameterizedTest

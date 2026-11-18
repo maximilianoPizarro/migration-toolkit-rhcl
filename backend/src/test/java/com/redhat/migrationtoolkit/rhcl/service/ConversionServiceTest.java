@@ -4,6 +4,7 @@ import com.redhat.migrationtoolkit.rhcl.model.ApiService;
 import com.redhat.migrationtoolkit.rhcl.model.Authentication;
 import com.redhat.migrationtoolkit.rhcl.model.Backend;
 import com.redhat.migrationtoolkit.rhcl.model.MappingRule;
+import com.redhat.migrationtoolkit.rhcl.model.PlanLimit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -343,6 +344,51 @@ class ConversionServiceTest {
         svc.authentication = auth("jwt");
         Map<String, String> files = service.convert(svc, "ns");
         assertNotNull(files.get("gateway.yaml"));
+    }
+
+    @Test
+    void convert_oidcProduct_usesIssuerPathsPlansAndReferenceGrant() {
+        ApiService svc = basicService("Neuralbank API (OIDC)", "neuralbank-oidc");
+        svc.authentication = auth("jwt");
+        svc.authentication.oidcIssuerEndpoint = "https://rhbk.apps.ocp.example.com/realms/neuralbank";
+        MappingRule customers = new MappingRule();
+        customers.httpMethod = "GET";
+        customers.pattern = "/api/v1/customers$";
+        MappingRule openapi = new MappingRule();
+        openapi.httpMethod = "GET";
+        openapi.pattern = "/q/openapi$";
+        MappingRule hits = new MappingRule();
+        hits.httpMethod = "GET";
+        hits.pattern = "/";
+        svc.mappingRules = List.of(hits, customers, openapi);
+        PlanLimit basic = new PlanLimit();
+        basic.systemName = "basic";
+        basic.limit = 60;
+        basic.window = "1m";
+        PlanLimit premium = new PlanLimit();
+        premium.systemName = "premium";
+        premium.limit = 300;
+        premium.window = "1m";
+        svc.planLimits = List.of(premium, basic);
+
+        Map<String, String> files = service.convert(
+                svc, "default", "http://neuralbank-backend-svc.neuralbank-stack.svc.cluster.local:8080");
+
+        String policy = files.get("policy.yaml");
+        assertTrue(policy.contains("https://rhbk.apps.ocp.example.com/realms/neuralbank"));
+        assertFalse(policy.contains("your-oidc-provider"));
+        String route = files.get("httproute.yaml");
+        assertTrue(route.contains("/api/v1/customers"));
+        assertFalse(route.contains("value: \"/\""));
+        assertTrue(route.contains("namespace: neuralbank-stack"));
+        assertTrue(files.get("docs-route.yaml").contains("value: /q"));
+        assertFalse(files.get("docs-route.yaml").contains("AuthPolicy"));
+        assertTrue(files.get("referencegrant.yaml").contains("namespace: neuralbank-stack"));
+        assertTrue(files.get("ratelimit.yaml").contains("limit: 60"));
+        assertTrue(files.get("ratelimit.yaml").contains("basic=60/1m"));
+        assertTrue(files.get("ratelimit.yaml").contains("premium=300/1m"));
+        assertTrue(files.get("apiproduct.yaml").contains("/q/openapi?format=json"));
+        assertTrue(files.get("gateway.yaml").contains("hostname: \"neuralbank-oidc-default.apps.ocp.example.com\""));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

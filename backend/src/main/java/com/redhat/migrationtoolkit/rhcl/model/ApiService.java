@@ -14,6 +14,7 @@ public class ApiService {
     public List<Backend> backends;
     public List<MappingRule> mappingRules;
     public List<Metric> metrics;
+    public List<PlanLimit> planLimits;
     public List<Policy> policies;
     public Authentication authentication;
     public String proxyEndpoint;

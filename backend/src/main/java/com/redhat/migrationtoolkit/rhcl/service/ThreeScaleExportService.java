@@ -7,6 +7,7 @@ import com.redhat.migrationtoolkit.rhcl.model.Authentication;
 import com.redhat.migrationtoolkit.rhcl.model.Backend;
 import com.redhat.migrationtoolkit.rhcl.model.MappingRule;
 import com.redhat.migrationtoolkit.rhcl.model.Metric;
+import com.redhat.migrationtoolkit.rhcl.model.PlanLimit;
 import com.redhat.migrationtoolkit.rhcl.model.Policy;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.eclipse.microprofile.rest.client.RestClientBuilder;
@@ -19,6 +20,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -151,6 +153,7 @@ public class ThreeScaleExportService {
                 service.metrics = fetchMetrics(client, service.id, accessToken);
                 service.authentication = extractAuthentication(svc);
                 service.backends = fetchBackendsForService(client, service.id, accessToken);
+                completeService(client, service, accessToken);
 
                 Map<String, Object> proxyConfig = safeGetProxyConfig(client, service.id, accessToken);
                 if (proxyConfig != null) {
@@ -183,8 +186,17 @@ public class ThreeScaleExportService {
         service.metrics = fetchMetrics(client, serviceId, accessToken);
         service.authentication = extractAuthentication(svc);
         service.backends = fetchBackendsForService(client, serviceId, accessToken);
+        completeService(client, service, accessToken);
 
         return service;
+    }
+
+    private void completeService(ThreeScaleClient client, ApiService service, String accessToken) {
+        applyIssuer(client, service, accessToken);
+        if (service.mappingRules == null || service.mappingRules.isEmpty()) {
+            service.mappingRules = rulesFromProxyConfig(client, service, accessToken);
+        }
+        service.planLimits = fetchPlanLimits(client, service.id, accessToken);
     }
 
     private List<Policy> fetchPolicies(ThreeScaleClient client, String serviceId, String accessToken) {
@@ -280,6 +292,8 @@ public class ThreeScaleExportService {
                     backend.name = (String) b.get("name");
                     backend.systemName = (String) b.get("system_name");
                     backend.privateEndpoint = (String) b.get("private_endpoint");
+                    Object path = usage.get("path");
+                    backend.publicPath = path != null ? path.toString() : null;
                     backends.add(backend);
                 } catch (Exception ex) {
                     LOG.warnf("Failed to fetch backend %s: %s", backendId, ex.getMessage());
@@ -290,6 +304,168 @@ public class ThreeScaleExportService {
             LOG.warnf("Failed to fetch backend usages for service %s: %s", serviceId, e.getMessage());
             return Collections.emptyList();
         }
+    }
+
+    private void applyIssuer(ThreeScaleClient client, ApiService service, String accessToken) {
+        if (service.authentication == null) {
+            return;
+        }
+        try {
+            Map<String, Object> wrapper = client.getProxy(service.id, accessToken);
+            Object proxyObj = wrapper != null ? wrapper.get("proxy") : null;
+            if (!(proxyObj instanceof Map<?, ?> proxy)) {
+                return;
+            }
+            Object issuer = proxy.get("oidc_issuer_endpoint");
+            if (issuer instanceof String value && !value.isBlank()) {
+                service.authentication.oidcIssuerEndpoint = value;
+            }
+        } catch (Exception e) {
+            LOG.warnf("Failed to read OIDC issuer for service %s: %s", service.id, e.getMessage());
+        }
+    }
+
+    private List<MappingRule> rulesFromProxyConfig(ThreeScaleClient client, ApiService service, String accessToken) {
+        Map<String, Object> config = safeGetProxyConfig(client, service.id, accessToken);
+        if (config == null) {
+            try {
+                config = client.getSandboxProxyConfig(service.id, accessToken);
+            } catch (Exception e) {
+                LOG.warnf("Failed to read sandbox proxy config for service %s: %s", service.id, e.getMessage());
+                return Collections.emptyList();
+            }
+        }
+        List<Map<String, Object>> rawRules = proxyRules(config);
+        Map<String, String> usageByBackend = new LinkedHashMap<>();
+        if (service.backends != null) {
+            for (Backend backend : service.backends) {
+                if (backend.id != null && backend.publicPath != null) {
+                    usageByBackend.put(backend.id, backend.publicPath);
+                }
+            }
+        }
+        List<MappingRule> rules = new ArrayList<>();
+        for (Map<String, Object> item : rawRules) {
+            Object nested = item.get("proxy_rule");
+            Map<String, Object> rule = nested instanceof Map<?, ?> map ? castMap(map) : item;
+            String ownerType = stringValue(rule.get("owner_type"));
+            String pattern = stringValue(rule.get("pattern"));
+            if ("Proxy".equals(ownerType) && (pattern == null || pattern.isBlank() || "/".equals(pattern) || "$".equals(pattern))) {
+                continue;
+            }
+            String ownerId = stringValue(rule.get("owner_id"));
+            pattern = stripUsagePrefix(pattern, usageByBackend.get(ownerId));
+            MappingRule mapped = new MappingRule();
+            mapped.httpMethod = stringValue(rule.get("http_method"));
+            mapped.pattern = pattern;
+            mapped.metricSystemName = stringValue(rule.get("metric_system_name"));
+            rules.add(mapped);
+        }
+        return rules;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<Map<String, Object>> proxyRules(Map<String, Object> config) {
+        try {
+            Map<String, Object> proxyConfig = (Map<String, Object>) config.get("proxy_config");
+            Map<String, Object> content = (Map<String, Object>) proxyConfig.get("content");
+            Map<String, Object> proxy = (Map<String, Object>) content.get("proxy");
+            Object rules = proxy.get("proxy_rules");
+            if (rules instanceof List<?> list) {
+                List<Map<String, Object>> typed = new ArrayList<>();
+                for (Object item : list) {
+                    if (item instanceof Map<?, ?> map) {
+                        typed.add(castMap(map));
+                    }
+                }
+                return typed;
+            }
+        } catch (Exception e) {
+            LOG.warnf("Proxy config has no proxy_rules: %s", e.getMessage());
+        }
+        return Collections.emptyList();
+    }
+
+    private List<PlanLimit> fetchPlanLimits(ThreeScaleClient client, String serviceId, String accessToken) {
+        try {
+            Map<String, Object> response = client.getApplicationPlans(serviceId, accessToken);
+            List<PlanLimit> plans = new ArrayList<>();
+            for (Map<String, Object> wrapper : extractList(response, "plans")) {
+                Map<String, Object> plan = wrapper.get("application_plan") instanceof Map<?, ?> nested
+                        ? castMap((Map<?, ?>) wrapper.get("application_plan"))
+                        : wrapper;
+                String planId = stringValue(plan.get("id"));
+                if (planId == null) {
+                    continue;
+                }
+                PlanLimit chosen = null;
+                for (Map<String, Object> limitWrapper : extractList(client.getPlanLimits(planId, accessToken), "limits")) {
+                    Map<String, Object> limit = limitWrapper.get("limit") instanceof Map<?, ?> nested
+                            ? castMap((Map<?, ?>) limitWrapper.get("limit"))
+                            : limitWrapper;
+                    String window = windowFor(stringValue(limit.get("period")));
+                    if (window == null || !(limit.get("value") instanceof Number number)) {
+                        continue;
+                    }
+                    PlanLimit candidate = new PlanLimit();
+                    candidate.systemName = stringValue(plan.get("system_name"));
+                    if (candidate.systemName == null || candidate.systemName.isBlank()) {
+                        candidate.systemName = "plan";
+                    }
+                    candidate.limit = number.longValue();
+                    candidate.window = window;
+                    if (chosen == null || "1m".equals(window) && !"1m".equals(chosen.window)) {
+                        chosen = candidate;
+                    }
+                }
+                if (chosen != null) {
+                    plans.add(chosen);
+                }
+            }
+            return plans;
+        } catch (Exception e) {
+            LOG.warnf("Failed to read application plans for service %s: %s", serviceId, e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    static String stripUsagePrefix(String pattern, String usagePath) {
+        if (pattern == null || pattern.isBlank()) {
+            return "/";
+        }
+        if (usagePath == null || usagePath.isBlank() || "/".equals(usagePath)) {
+            return pattern;
+        }
+        String prefix = usagePath.endsWith("/") ? usagePath.substring(0, usagePath.length() - 1) : usagePath;
+        if (pattern.startsWith(prefix + "/")) {
+            return pattern.substring(prefix.length());
+        }
+        return pattern;
+    }
+
+    static String windowFor(String period) {
+        if (period == null) {
+            return null;
+        }
+        return switch (period.toLowerCase()) {
+            case "second" -> "1s";
+            case "minute" -> "1m";
+            case "hour" -> "1h";
+            case "day" -> "1d";
+            case "week" -> "7d";
+            case "month" -> "30d";
+            case "year" -> "365d";
+            default -> null;
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> castMap(Map<?, ?> map) {
+        return (Map<String, Object>) map;
+    }
+
+    private static String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
     }
 
     private Authentication extractAuthentication(Map<String, Object> svc) {

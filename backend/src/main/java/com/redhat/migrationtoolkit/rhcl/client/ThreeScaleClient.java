@@ -61,4 +61,24 @@ public interface ThreeScaleClient {
     @Path("/admin/api/services/{serviceId}/metrics.json")
     Map<String, Object> getMetrics(@PathParam("serviceId") String serviceId,
                                     @QueryParam("access_token") String accessToken);
+
+    @GET
+    @Path("/admin/api/services/{serviceId}/proxy.json")
+    Map<String, Object> getProxy(@PathParam("serviceId") String serviceId,
+                                  @QueryParam("access_token") String accessToken);
+
+    @GET
+    @Path("/admin/api/services/{serviceId}/proxy/configs/sandbox/latest.json")
+    Map<String, Object> getSandboxProxyConfig(@PathParam("serviceId") String serviceId,
+                                               @QueryParam("access_token") String accessToken);
+
+    @GET
+    @Path("/admin/api/services/{serviceId}/application_plans.json")
+    Map<String, Object> getApplicationPlans(@PathParam("serviceId") String serviceId,
+                                             @QueryParam("access_token") String accessToken);
+
+    @GET
+    @Path("/admin/api/application_plans/{planId}/limits.json")
+    Map<String, Object> getPlanLimits(@PathParam("planId") String planId,
+                                      @QueryParam("access_token") String accessToken);
 }

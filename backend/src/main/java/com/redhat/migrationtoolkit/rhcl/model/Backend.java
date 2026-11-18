@@ -8,6 +8,7 @@ public class Backend {
     public String description;
     public String systemName;
     public String privateEndpoint;
+    public String publicPath;
     public List<MappingRule> mappingRules;
     public List<Metric> metrics;
 }

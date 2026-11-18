@@ -2,13 +2,19 @@ package com.redhat.migrationtoolkit.rhcl.service;
 
 import com.redhat.migrationtoolkit.rhcl.model.ApiService;
 import com.redhat.migrationtoolkit.rhcl.model.MappingRule;
+import com.redhat.migrationtoolkit.rhcl.model.PlanLimit;
 import com.redhat.migrationtoolkit.rhcl.model.Policy;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
 
+import java.net.URI;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 @ApplicationScoped
 public class ConversionService {
@@ -51,19 +57,42 @@ public class ConversionService {
         String internalService = backendType == BackendType.INTERNAL
                 ? extractInternalService(backendUrl, name) : null;
         int internalPort = backendType == BackendType.INTERNAL ? extractPort(backendUrl, 8080) : 8080;
+        String backendNamespace = extractInternalNamespace(backendUrl);
+        String publicHost = publicHostname(name, namespace, service);
+        List<Match> matches = matchesFrom(service);
+        List<Match> apiMatches = new ArrayList<>();
+        boolean hasDocs = false;
+        for (Match match : matches) {
+            if (match.path.equals("/q") || match.path.startsWith("/q/")) {
+                hasDocs = true;
+            } else {
+                apiMatches.add(match);
+            }
+        }
 
-        files.put("gateway.yaml", generateGateway(name, namespace));
-        files.put("route.yaml", generateOpenShiftRoute(name, namespace));
+        files.put("gateway.yaml", generateGateway(name, namespace, publicHost));
+        files.put("route.yaml", generateOpenShiftRoute(name, namespace, publicHost));
+        if (backendNamespace != null && !backendNamespace.isBlank() && !backendNamespace.equals(namespace)
+                && internalService != null) {
+            files.put("referencegrant.yaml", generateReferenceGrant(name, namespace, backendNamespace, internalService));
+        }
         files.put("httproute.yaml",  generateHttpRoute(
                 name, namespace, service, backendType, externalHost, internalService, internalPort,
-                extractInternalNamespace(backendUrl)));
+                backendNamespace, publicHost, apiMatches));
+        if (hasDocs) {
+            files.put("docs-route.yaml", generateDocsRoute(
+                    name, namespace, internalService, internalPort, backendNamespace, publicHost));
+        }
+        if (service.planLimits != null && !service.planLimits.isEmpty()) {
+            files.put("ratelimit.yaml", generateRateLimit(name, namespace, service.planLimits));
+        }
         files.put("policy.yaml",     generateAuthPolicy(name, namespace, service, anonymousTarget));
         String authTypeForSecret = service.authentication != null ? service.authentication.type : "none";
         if (!"jwt".equals(authTypeForSecret)) {
             files.put("secret.yaml", generateSecret(name, namespace, service));
         }
         files.put("configmap.yaml",  generateConfigMap(name, namespace, service, backendUrl));
-        files.put("apiproduct.yaml", generateApiProduct(name, namespace, service));
+        files.put("apiproduct.yaml", generateApiProduct(name, namespace, service, publicHost, hasDocs));
 
         String authType = service.authentication != null ? service.authentication.type : "none";
         if ("apiKey".equals(authType)) {
@@ -197,7 +226,140 @@ public class ConversionService {
         return path.isBlank() ? "/" : path;
     }
 
-    private String generateOpenShiftRoute(String name, String namespace) {
+    private List<Match> matchesFrom(ApiService service) {
+        List<Match> matches = new ArrayList<>();
+        if (service.mappingRules == null) {
+            return matches;
+        }
+        Set<String> seen = new LinkedHashSet<>();
+        for (MappingRule rule : service.mappingRules) {
+            String path = sanitizeMappingPath(rule.pattern);
+            if ("/".equals(path)) {
+                continue;
+            }
+            String method = rule.httpMethod != null && !rule.httpMethod.isBlank() ? rule.httpMethod : "GET";
+            if (seen.add(method + " " + path)) {
+                matches.add(new Match(path, method));
+            }
+        }
+        return matches;
+    }
+
+    private String publicHostname(String name, String namespace, ApiService service) {
+        if (service.authentication == null || service.authentication.oidcIssuerEndpoint == null) {
+            return null;
+        }
+        try {
+            String host = URI.create(service.authentication.oidcIssuerEndpoint).getHost();
+            if (host == null) {
+                return null;
+            }
+            int dot = host.indexOf('.');
+            if (dot < 1 || !host.substring(dot + 1).startsWith("apps.")) {
+                return null;
+            }
+            return name + "-" + namespace + "." + host.substring(dot + 1);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String generateDocsRoute(String name, String namespace, String backendService, int port,
+                                     String backendNamespace, String publicHost) {
+        if (backendService == null || backendService.isBlank()) {
+            backendService = name + "-backend";
+        }
+        String hostnames = publicHost == null ? "" : "  hostnames:\n    - " + publicHost + "\n";
+        String backendNsLine = backendNamespace != null && !backendNamespace.isBlank() && !backendNamespace.equals(namespace)
+                ? "          namespace: " + backendNamespace + "\n"
+                : "";
+        return """
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: %s-docs-route
+  namespace: %s
+  labels:
+    app: %s
+    migrated-from: 3scale
+spec:
+%s  parentRefs:
+    - name: %s-gateway
+      namespace: %s
+      sectionName: http
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /q
+      backendRefs:
+        - name: %s
+%s          port: %d
+""".formatted(name, namespace, name, hostnames, name, namespace, backendService, backendNsLine, port);
+    }
+
+    private String generateReferenceGrant(String name, String fromNamespace, String backendNamespace, String backendService) {
+        return """
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: %s-backend
+  namespace: %s
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: %s
+  to:
+    - group: ""
+      kind: Service
+      name: %s
+""".formatted(name, backendNamespace, fromNamespace, backendService);
+    }
+
+    private String generateRateLimit(String name, String namespace, List<PlanLimit> plans) {
+        PlanLimit enforced = plans.get(0);
+        StringBuilder listed = new StringBuilder();
+        for (PlanLimit plan : plans) {
+            if (listed.length() > 0) {
+                listed.append(',');
+            }
+            listed.append(plan.systemName).append('=').append(plan.limit).append('/').append(plan.window);
+            if (plan.limit < enforced.limit) {
+                enforced = plan;
+            }
+        }
+        String limitName = enforced.systemName.replaceAll("[^A-Za-z0-9-]", "-");
+        return """
+apiVersion: kuadrant.io/v1
+kind: RateLimitPolicy
+metadata:
+  name: %s-ratelimit
+  namespace: %s
+  labels:
+    app: %s
+    migrated-from: 3scale
+  annotations:
+    migration-toolkit.redhat.com/plans: "%s"
+spec:
+  targetRef:
+    group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: %s-route
+  # JWT traffic has no plan claim in the rate-limit filter, so the lowest 3scale plan is enforced.
+  overrides:
+    limits:
+      %s:
+        rates:
+          - limit: %d
+            window: %s
+""".formatted(name, namespace, name, listed, name, limitName, enforced.limit, enforced.window);
+    }
+
+    private record Match(String path, String method) {}
+
+    private String generateOpenShiftRoute(String name, String namespace, String publicHost) {
+        String hostLine = publicHost == null ? "" : "  host: " + publicHost + "\n";
         return """
 apiVersion: route.openshift.io/v1
 kind: Route
@@ -205,7 +367,7 @@ metadata:
   name: %s
   namespace: %s
 spec:
-  to:
+%s  to:
     kind: Service
     name: %s-gateway-istio
   port:
@@ -213,10 +375,10 @@ spec:
   tls:
     termination: edge
     insecureEdgeTerminationPolicy: Redirect
-""".formatted(name, namespace, name);
+""".formatted(name, namespace, hostLine, name);
     }
 
-    private String generateGateway(String name, String namespace) {
+    private String generateGateway(String name, String namespace, String publicHost) {
         return """
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
@@ -234,10 +396,10 @@ spec:
     - name: http
       protocol: HTTP
       port: 8080
-      allowedRoutes:
+%s      allowedRoutes:
         namespaces:
           from: Same
-""".formatted(name, namespace, name);
+""".formatted(name, namespace, name, publicHost == null ? "" : "      hostname: \"" + publicHost + "\"\n");
     }
 
     // ─────────────────────────────────────────────
@@ -246,7 +408,8 @@ spec:
 
     private String generateHttpRoute(String name, String namespace, ApiService service,
                                      BackendType backendType, String externalHost,
-                                     String internalService, int internalPort, String backendNamespace) {
+                                     String internalService, int internalPort, String backendNamespace,
+                                     String publicHost, List<Match> apiMatches) {
         int backendPort   = backendType == BackendType.EXTERNAL ? 443 : internalPort;
         String backendSvc = backendType == BackendType.EXTERNAL
                 ? (name + "-backend")
@@ -268,6 +431,7 @@ spec:
                 : "";
 
         String annotations = buildUpstreamAnnotations(service);
+        String hostnames = publicHost == null ? "" : "  hostnames:\n    - " + publicHost + "\n";
         StringBuilder sb = new StringBuilder();
         sb.append("""
 apiVersion: gateway.networking.k8s.io/v1
@@ -279,22 +443,20 @@ metadata:
     app: %s
     migrated-from: 3scale
 %sspec:
-  parentRefs:
+%s  parentRefs:
     - name: %s-gateway
       namespace: %s
       sectionName: http
   rules:
-""".formatted(name, namespace, name, annotations, name, namespace));
+""".formatted(name, namespace, name, annotations, hostnames, name, namespace));
 
         String timeoutsBlock = buildTimeoutsBlock(service);
         String backendNsLine = backendNamespace != null && !backendNamespace.isBlank() && !backendNamespace.equals(namespace)
                 ? "          namespace: " + backendNamespace + "\n"
                 : "";
 
-        if (service.mappingRules != null && !service.mappingRules.isEmpty()) {
-            for (MappingRule rule : service.mappingRules) {
-                String path   = sanitizeMappingPath(rule.pattern);
-                String method = rule.httpMethod != null ? rule.httpMethod : "GET";
+        if (!apiMatches.isEmpty()) {
+            for (Match match : apiMatches) {
                 sb.append("""
     - matches:
         - path:
@@ -304,7 +466,7 @@ metadata:
 %s%s      backendRefs:
         - name: %s
 %s          port: %d
-""".formatted(path, method, filtersBlock, timeoutsBlock, backendSvc, backendNsLine, backendPort));
+""".formatted(match.path, match.method, filtersBlock, timeoutsBlock, backendSvc, backendNsLine, backendPort));
             }
         } else {
             sb.append("""
@@ -919,9 +1081,16 @@ stringData:
     // Kuadrant Developer Portal Resources
     // ─────────────────────────────────────────────
 
-    private String generateApiProduct(String name, String namespace, ApiService service) {
+    private String generateApiProduct(String name, String namespace, ApiService service,
+                                      String publicHost, boolean hasDocs) {
         String displayName = service.name != null ? service.name : name;
         String description = service.description != null ? service.description : "Migrated from 3scale";
+        String documentation = publicHost != null && hasDocs
+                ? """
+  documentation:
+    openAPISpecURL: "https://%s/q/openapi?format=json"
+""".formatted(publicHost)
+                : "";
         return """
 apiVersion: devportal.kuadrant.io/v1alpha1
 kind: APIProduct
@@ -941,7 +1110,7 @@ spec:
     kind: HTTPRoute
     name: %s-route
   version: v1
-""".formatted(name, namespace, name, displayName, description.replace("\"", "'"), name);
+%s""".formatted(name, namespace, name, displayName, description.replace("\"", "'"), name, documentation);
     }
 
     private String generateApiKey(String name, String namespace) {
