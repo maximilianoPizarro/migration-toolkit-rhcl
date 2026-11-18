@@ -40,6 +40,12 @@ public class ConversionService {
         Map<String, String> files = new LinkedHashMap<>();
         String name = toKebabCase(service.systemName != null ? service.systemName : service.name);
 
+        if ((backendUrl == null || backendUrl.isBlank())
+                && service.backends != null && !service.backends.isEmpty()
+                && service.backends.get(0).privateEndpoint != null) {
+            backendUrl = service.backends.get(0).privateEndpoint;
+        }
+
         BackendType backendType = detectBackendType(backendUrl);
         String externalHost = backendType == BackendType.EXTERNAL ? extractHostname(backendUrl) : null;
         String internalService = backendType == BackendType.INTERNAL
@@ -47,10 +53,15 @@ public class ConversionService {
         int internalPort = backendType == BackendType.INTERNAL ? extractPort(backendUrl, 8080) : 8080;
 
         files.put("gateway.yaml", generateGateway(name, namespace));
+        files.put("route.yaml", generateOpenShiftRoute(name, namespace));
         files.put("httproute.yaml",  generateHttpRoute(
-                name, namespace, service, backendType, externalHost, internalService, internalPort));
+                name, namespace, service, backendType, externalHost, internalService, internalPort,
+                extractInternalNamespace(backendUrl)));
         files.put("policy.yaml",     generateAuthPolicy(name, namespace, service, anonymousTarget));
-        files.put("secret.yaml",     generateSecret(name, namespace, service));
+        String authTypeForSecret = service.authentication != null ? service.authentication.type : "none";
+        if (!"jwt".equals(authTypeForSecret)) {
+            files.put("secret.yaml", generateSecret(name, namespace, service));
+        }
         files.put("configmap.yaml",  generateConfigMap(name, namespace, service, backendUrl));
         files.put("apiproduct.yaml", generateApiProduct(name, namespace, service));
 
@@ -132,6 +143,18 @@ public class ConversionService {
      * "http://my-service:8080" → "my-service"
      * 抽出できない場合は "{name}-backend" を返す。
      */
+    private String extractInternalNamespace(String url) {
+        String host = extractHostname(url);
+        if (host == null) {
+            return null;
+        }
+        String[] parts = host.split("\\.");
+        if (parts.length >= 2 && (host.endsWith(".svc") || host.endsWith(".svc.cluster.local"))) {
+            return parts[1];
+        }
+        return null;
+    }
+
     private String extractInternalService(String url, String name) {
         String host = extractHostname(url);
         if (host == null || host.isBlank()) {
@@ -162,6 +185,37 @@ public class ConversionService {
     // Gateway
     // ─────────────────────────────────────────────
 
+    private String sanitizeMappingPath(String pattern) {
+        if (pattern == null || pattern.isBlank()) {
+            return "/";
+        }
+        String path = pattern.replaceAll("\\$$", "").replaceAll("\\{\\?\\}", "*");
+        path = path.replaceAll("/\\{[^}]+}.*", "");
+        if (!path.startsWith("/")) {
+            path = "/" + path;
+        }
+        return path.isBlank() ? "/" : path;
+    }
+
+    private String generateOpenShiftRoute(String name, String namespace) {
+        return """
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  to:
+    kind: Service
+    name: %s-gateway-istio
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+""".formatted(name, namespace, name);
+    }
+
     private String generateGateway(String name, String namespace) {
         return """
 apiVersion: gateway.networking.k8s.io/v1
@@ -172,26 +226,18 @@ metadata:
   labels:
     app: %s
     migrated-from: 3scale
+  annotations:
+    networking.istio.io/service-type: ClusterIP
 spec:
   gatewayClassName: istio
   listeners:
     - name: http
       protocol: HTTP
-      port: 80
+      port: 8080
       allowedRoutes:
         namespaces:
           from: Same
-    - name: https
-      protocol: HTTPS
-      port: 443
-      tls:
-        mode: Terminate
-        certificateRefs:
-          - name: %s-tls
-      allowedRoutes:
-        namespaces:
-          from: Same
-""".formatted(name, namespace, name, name);
+""".formatted(name, namespace, name);
     }
 
     // ─────────────────────────────────────────────
@@ -200,7 +246,7 @@ spec:
 
     private String generateHttpRoute(String name, String namespace, ApiService service,
                                      BackendType backendType, String externalHost,
-                                     String internalService, int internalPort) {
+                                     String internalService, int internalPort, String backendNamespace) {
         int backendPort   = backendType == BackendType.EXTERNAL ? 443 : internalPort;
         String backendSvc = backendType == BackendType.EXTERNAL
                 ? (name + "-backend")
@@ -241,10 +287,13 @@ metadata:
 """.formatted(name, namespace, name, annotations, name, namespace));
 
         String timeoutsBlock = buildTimeoutsBlock(service);
+        String backendNsLine = backendNamespace != null && !backendNamespace.isBlank() && !backendNamespace.equals(namespace)
+                ? "          namespace: " + backendNamespace + "\n"
+                : "";
 
         if (service.mappingRules != null && !service.mappingRules.isEmpty()) {
             for (MappingRule rule : service.mappingRules) {
-                String path   = rule.pattern != null ? rule.pattern.replaceAll("\\{\\?\\}", "*") : "/";
+                String path   = sanitizeMappingPath(rule.pattern);
                 String method = rule.httpMethod != null ? rule.httpMethod : "GET";
                 sb.append("""
     - matches:
@@ -254,8 +303,8 @@ metadata:
           method: %s
 %s%s      backendRefs:
         - name: %s
-          port: %d
-""".formatted(path, method, filtersBlock, timeoutsBlock, backendSvc, backendPort));
+%s          port: %d
+""".formatted(path, method, filtersBlock, timeoutsBlock, backendSvc, backendNsLine, backendPort));
             }
         } else {
             sb.append("""
@@ -265,8 +314,8 @@ metadata:
             value: "/"
 %s%s      backendRefs:
         - name: %s
-          port: %d
-""".formatted(filtersBlock, timeoutsBlock, backendSvc, backendPort));
+%s          port: %d
+""".formatted(filtersBlock, timeoutsBlock, backendSvc, backendNsLine, backendPort));
         }
         return sb.toString();
     }
@@ -537,6 +586,9 @@ spec:
       jwt-auth:
         jwt:
           issuerUrl: %s
+        credentials:
+          authorizationHeader:
+            prefix: Bearer
 """.formatted(name, namespace, name, name, issuer);
         } else if ("apiKey".equals(authType)) {
             return """

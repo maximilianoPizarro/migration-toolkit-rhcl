@@ -32,6 +32,7 @@ class ConversionServiceTest {
         Map<String, String> files = service.convert(svc, "test-ns");
 
         assertTrue(files.containsKey("gateway.yaml"));
+        assertTrue(files.containsKey("route.yaml"));
         assertTrue(files.containsKey("httproute.yaml"));
         assertTrue(files.containsKey("policy.yaml"));
         assertTrue(files.containsKey("secret.yaml"));
@@ -239,12 +240,14 @@ class ConversionServiceTest {
     }
 
     @Test
-    void convert_jwtAuth_secretContainsPlaceholders() {
+    void convert_jwtAuth_usesBearerAndSkipsPlaceholderSecret() {
         ApiService svc = basicService("my-api", "my-api");
         svc.authentication = auth("jwt");
         Map<String, String> files = service.convert(svc, "ns");
-        String secret = files.get("secret.yaml");
-        assertTrue(secret.contains("REPLACE_ME"));
+        assertFalse(files.containsKey("secret.yaml"));
+        assertTrue(files.get("policy.yaml").contains("prefix: Bearer"));
+        assertTrue(files.get("gateway.yaml").contains("port: 8080"));
+        assertFalse(files.get("gateway.yaml").contains("certificateRefs"));
     }
 
     // ── ServiceEntry + DestinationRule ────────────────────────────────────────
